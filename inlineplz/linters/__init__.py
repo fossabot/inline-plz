@@ -687,6 +687,7 @@ class LinterRunner:
         #     return 0, ""
 
         stdout, stderr = await proc.communicate()
+        # TODO: Fix 0xa9, the copyright symbol, by using a different decoding method
         output = "{}\n{}".format(stdout.decode("utf-8"), stderr.decode("utf-8")).strip()
         if output and ((log_on_fail and proc.returncode) or log_all):
             print(output)
@@ -830,7 +831,7 @@ class LinterRunner:
                 continue
 
             self.previous_install_commands.append(install_cmd)
-            if not self.installed(config):
+            if not await self.installed(config):
                 try:
                     print("-" * 80)
                     await self.run_command(install_cmd, log_all=True)
@@ -914,7 +915,7 @@ class LinterRunner:
             config = LINTERS.get(linter)
             try:
                 if (install or autorun) and config.get("install"):
-                    self.install_linter(config)
+                    await self.install_linter(config)
                 if config.get("run_per_file"):
                     output = await self.run_per_file(config, ignore_paths, config_dir)
                 else:
