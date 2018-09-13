@@ -203,7 +203,8 @@ def inline(args):
 
         my_interface.start_review()
     try:
-        messages = linters.lint(
+        linter_runner = linters.LinterRunner()
+        messages = linter_runner.lint(
             args.install,
             args.autorun,
             args.ignore_paths,

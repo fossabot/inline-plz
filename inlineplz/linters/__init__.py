@@ -6,8 +6,8 @@ from __future__ import absolute_import
 from __future__ import print_function
 from __future__ import unicode_literals
 
+import asyncio
 import fnmatch
-from multiprocessing.pool import ThreadPool as Pool
 import os.path
 import shutil
 import sys
@@ -15,6 +15,9 @@ import time
 import traceback
 
 from identify import identify
+from inlineplz import parsers
+from inlineplz import message
+from inlineplz.util import system
 
 if sys.version_info >= (3, 5):
     import subprocess
@@ -27,10 +30,6 @@ try:
     from os import scandir, walk
 except ImportError:
     from scandir import scandir, walk  # noqa
-
-from inlineplz import parsers
-from inlineplz import message
-from inlineplz.util import system
 
 HERE = os.path.dirname(__file__)
 
@@ -203,7 +202,7 @@ LINTERS = {
         "run_per_file": False,
     },
     "detect-secrets": {
-        # TODO: switch this to installing from pypi once they release my fix from https://github.com/Yelp/detect-secrets/pull/69
+        # TODO: install from pypi once they release my fix from https://github.com/Yelp/detect-secrets/pull/69
         # "install": [[sys.executable, "-m", "pip", "install", "-U", "detect-secrets"]],
         "install": [
             [
@@ -650,293 +649,307 @@ LINTERS = {
 }
 
 
-def run_command(command, log_on_fail=False, log_all=False, timeout=120):
-    print('Running: "{}"'.format(" ".join(command)))
-    shell = False
-    if os.name == "nt":
-        shell = True
-    popen_kwargs = {
-        "args": command,
-        "stdin": subprocess.PIPE,
-        "stdout": subprocess.PIPE,
-        "stderr": subprocess.PIPE,
-        "shell": shell,
-        "env": os.environ,
-        "universal_newlines": True,
-        "timeout": timeout,
-    }
-    if sys.version_info[0] >= 3 and sys.version_info[1] >= 6:
-        popen_kwargs["encoding"] = "utf-8"
-    try:
-        proc = subprocess.run(**popen_kwargs)
-    except subprocess.TimeoutExpired:
-        print("Timeout: {}".format(command))
-        return 0, ""
+class LinterRunner:
+    def __init__(self):
+        # track commands we've already run so that we don't re-run them
+        self.previous_install_commands = []
 
-    stdout, stderr = proc.stdout, proc.stderr
-    output = "{}\n{}".format(stdout, stderr).strip()
-    if output and ((log_on_fail and proc.returncode) or log_all):
-        print(output)
-        sys.stdout.flush()
-    return proc.returncode, output
+        # Default event loop is SelectorEventLoop, which on Windows does not support subprocesses
+        if sys.platform == "win32":
+            self.event_loop = asyncio.ProactorEventLoop()
+            asyncio.set_event_loop(self.event_loop)
+        else:
+            # TODO: Make sure this works on Mac, may need to create an event loop
+            self.event_loop = asyncio.get_event_loop()
 
+    async def run_command(self, command, log_on_fail=False, log_all=False, timeout=120):
+        print('Running command: {}'.format(" ".join(command)))
 
-def performance_hacks():
-    # https://github.com/npm/npm/issues/11283
-    # npm's progress bar makes npm installs much slower
-    try:
-        run_command(["npm", "set", "progress=false"])
-    except Exception:
-        pass
+        popen_kwargs = {
+            "stdin": asyncio.subprocess.PIPE,
+            "stdout": asyncio.subprocess.PIPE,
+            "stderr": asyncio.subprocess.PIPE,
+            "env": os.environ
+        }
+        if sys.version_info[0] >= 3 and sys.version_info[1] >= 6:
+            popen_kwargs["encoding"] = "utf-8"
 
+        if sys.platform == "win32":
+            proc = await asyncio.create_subprocess_shell(" ".join(command), **popen_kwargs)
+        else:
+            proc = await asyncio.create_subprocess_exec(*command, **popen_kwargs)
 
-def cleanup():
-    """Delete standard installation directories."""
-    for install_dir in INSTALL_DIRS:
+        # TODO: Deal with timeouts
+        # try:
+        #     proc = subprocess.run(**popen_kwargs)
+        # except subprocess.TimeoutExpired:
+        #     print("Timeout: {}".format(command))
+        #     return 0, ""
+
+        stdout, stderr = await proc.communicate()
+        output = "{}\n{}".format(stdout.decode("utf-8"), stderr.decode("utf-8")).strip()
+        if output and ((log_on_fail and proc.returncode) or log_all):
+            print(output)
+            sys.stdout.flush()
+        return proc.returncode, output
+
+    async def performance_hacks(self):
+        # https://github.com/npm/npm/issues/11283
+        # npm's progress bar makes npm installs much slower
         try:
-            shutil.rmtree(install_dir, ignore_errors=True)
-        except Exception:
-            print(traceback.format_exc())
-            print("Failed to delete {}".format(install_dir))
-
-
-def should_ignore_path(path, ignore_paths):
-    for ignore_path in ignore_paths:
-        if (
-            os.path.relpath(path).startswith(ignore_path)
-            or path.startswith(ignore_path)
-            or fnmatch.fnmatch(path, ignore_path)
-            or ignore_path in path.split(os.path.sep)
-        ):
-            return True
-
-    return False
-
-
-def run_per_file(config, ignore_paths=None, path=None, config_dir=None):
-    ignore_paths = ignore_paths or []
-    path = path or os.getcwd()
-    cmd = run_config(config, config_dir)
-    run_cmds = []
-    patterns = PATTERNS.get(config.get("language"))
-    concurrency = config.get("concurrency")
-    paths = all_filenames_in_dir(path=path, ignore_paths=ignore_paths)
-    for pattern in patterns:
-        for filepath in fnmatch.filter(paths, pattern):
-            if "text" in identify.tags_from_path(filepath):
-                run_cmds.append(cmd + [filepath])
-    pool = Pool(processes=concurrency)
-
-    def result(run_cmd):
-        _, out = run_command(run_cmd, timeout=5)
-        return run_cmd[-1], out.strip()
-
-    output = pool.map(result, run_cmds)
-    return output
-
-
-def linters_to_run(
-    autorun=False, ignore_paths=None, enabled_linters=None, disabled_linters=None
-):
-    linters = set()
-    enabled_linters = enabled_linters or []
-    disabled_linters = disabled_linters or []
-    try:
-        enabled_linters.extend(enabled_linters[0].split(","))
-    except (IndexError, AttributeError):
-        pass
-    try:
-        disabled_linters.extend(disabled_linters[0].split(","))
-    except (IndexError, AttributeError):
-        pass
-    if not autorun:
-        for linter, config in LINTERS.items():
-            if linter in enabled_linters:
-                linters.add(linter)
-    else:
-        dotfilefound = {}
-        for linter, config in LINTERS.items():
-            if dotfiles_exist(config):
-                dotfilefound[config.get("language")] = True
-                if (
-                    config.get("run_if_dotfile_in_root")
-                    and linter not in disabled_linters
-                ):
-                    linters.add(linter)
-            if dotfilefound.get(config.get("language")) and config.get("autorun"):
-                if linter not in disabled_linters:
-                    linters.add(linter)
-        filenames = all_filenames_in_dir(path=os.getcwd(), ignore_paths=ignore_paths)
-        for linter, config in LINTERS.items():
-            if linter in enabled_linters or (
-                not dotfilefound.get(config.get("language"))
-                and should_autorun(config, filenames)
-            ):
-                if linter not in disabled_linters:
-                    linters.add(linter)
-    return linters
-
-
-def all_filenames_in_dir(path=None, ignore_paths=None):
-    path = path or os.getcwd()
-    # http://stackoverflow.com/a/2186565
-    paths = set()
-    for root, dirnames, filenames in os.walk(path, topdown=True):
-        try:
-            for ignore in ignore_paths:
-                dirnames.remove(ignore)
-        except ValueError:
+            await self.run_command(["npm", "set", "progress=false"])
+        except Exception as e:
             pass
-        if should_ignore_path(root, ignore_paths):
-            continue
 
-        for filename in filenames:
-            full_path = os.path.join(root, filename)
-            if "text" in identify.tags_from_path(full_path):
-                paths.add(full_path)
-    return paths
+    def cleanup(self):
+        """Delete standard installation directories."""
+        for install_dir in INSTALL_DIRS:
+            try:
+                shutil.rmtree(install_dir, ignore_errors=True)
+            except Exception:
+                print(traceback.format_exc())
+                print("Failed to delete {}".format(install_dir))
 
-
-def should_autorun(config, filenames):
-    patterns = PATTERNS.get(config.get("language"))
-    if config.get("autorun"):
-        for pattern in patterns:
-            if fnmatch.filter(filenames, pattern):
+    def should_ignore_path(self, path, ignore_paths):
+        for ignore_path in ignore_paths:
+            if (
+                os.path.relpath(path).startswith(ignore_path)
+                or path.startswith(ignore_path)
+                or fnmatch.fnmatch(path, ignore_path)
+                or ignore_path in path.split(os.path.sep)
+            ):
                 return True
 
-    return False
-
-
-def dotfiles_exist(config, path=None):
-    path = path or os.getcwd()
-    return any(
-        dotfile.strip() in os.listdir(path) for dotfile in config.get("dotfiles")
-    )
-
-
-# track commands we've already run so that we don't re-run them
-PREVIOUS_INSTALL_COMMANDS = []
-
-
-def install_linter(config):
-    install_cmds = config.get("install")
-    for install_cmd in install_cmds:
-        if install_cmd in PREVIOUS_INSTALL_COMMANDS:
-            continue
-
-        PREVIOUS_INSTALL_COMMANDS.append(install_cmd)
-        if not installed(config):
-            try:
-                print("-" * 80)
-                run_command(install_cmd, log_all=True)
-            except OSError:
-                print(
-                    "Install failed: {0}\n{1}".format(
-                        install_cmd, traceback.format_exc()
-                    )
-                )
-        else:
-            return
-
-
-def install_trusted():
-    for install_cmd in TRUSTED_INSTALL:
-        try:
-            print("*" * 80)
-            run_command(install_cmd, log_all=True)
-        except OSError:
-            print(
-                "Install failed: {0}\n{1}".format(install_cmd, traceback.format_exc())
-            )
-
-
-def installed(config):
-    try:
-        returncode, _ = run_command(config.get("help"))
-        return returncode == 0
-
-    except (subprocess.CalledProcessError, OSError):
         return False
 
+    async def run_per_file(self, config, ignore_paths=None, path=None, config_dir=None):
+        ignore_paths = ignore_paths or []
+        path = path or os.getcwd()
+        cmd = self.run_config(config, config_dir)
+        run_cmds = []
+        run_tasks = []
+        patterns = PATTERNS.get(config.get("language"))
+        # TODO: Remove concurrency
+        paths = self.all_filenames_in_dir(path=path, ignore_paths=ignore_paths)
+        for pattern in patterns:
+            for filepath in fnmatch.filter(paths, pattern):
+                if "text" in identify.tags_from_path(filepath):
+                    run_cmds.append(cmd + [filepath])
+                    run_tasks.append(self.event_loop.create_task(self.run_command(run_cmds[-1], timeout=5)))
 
-def run_config(config, config_dir):
-    if dotfiles_exist(config) and config.get("run"):
-        return config.get("run")
+        output = []
+        for run_cmd, run_task in zip(run_cmds, run_tasks):
+            _, out = await run_task
 
-    if not (config_dir and dotfiles_exist(config, config_dir)):
-        config_dir = os.path.abspath(os.path.join(HERE, "config"))
-    return [
-        os.path.normpath(item.format(config_dir=config_dir))
-        if "..." not in item
-        else item.format(config_dir=config_dir)
-        for item in (config.get("rundefault") or config.get("run"))
-    ]
+            # Return the filename and the output
+            output.append((run_cmd[-1], out.strip()))
 
+        return output
 
-def lint(
-    install=False,
-    autorun=False,
-    ignore_paths=None,
-    config_dir=None,
-    enabled_linters=None,
-    disabled_linters=None,
-    trusted=False,
-):
-    messages = message.Messages()
-    cleanup()
-    performance_hacks()
-    if trusted and (install or autorun):
-        install_trusted()
-    for linter in linters_to_run(
-        autorun, ignore_paths, enabled_linters, disabled_linters
+    def linters_to_run(
+        self, autorun=False, ignore_paths=None, enabled_linters=None, disabled_linters=None
     ):
-        if system.should_stop():
-            return messages.get_messages()
+        linters = set()
+        enabled_linters = enabled_linters or []
+        disabled_linters = disabled_linters or []
+        try:
+            enabled_linters.extend(enabled_linters[0].split(","))
+        except (IndexError, AttributeError):
+            pass
+        try:
+            disabled_linters.extend(disabled_linters[0].split(","))
+        except (IndexError, AttributeError):
+            pass
+        if not autorun:
+            for linter, config in LINTERS.items():
+                if linter in enabled_linters:
+                    linters.add(linter)
+        else:
+            dotfilefound = {}
+            for linter, config in LINTERS.items():
+                if self.dotfiles_exist(config):
+                    dotfilefound[config.get("language")] = True
+                    if (
+                        config.get("run_if_dotfile_in_root")
+                        and linter not in disabled_linters
+                    ):
+                        linters.add(linter)
+                if dotfilefound.get(config.get("language")) and config.get("autorun"):
+                    if linter not in disabled_linters:
+                        linters.add(linter)
+            filenames = self.all_filenames_in_dir(path=os.getcwd(), ignore_paths=ignore_paths)
+            for linter, config in LINTERS.items():
+                if linter in enabled_linters or (
+                    not dotfilefound.get(config.get("language"))
+                    and self.should_autorun(config, filenames)
+                ):
+                    if linter not in disabled_linters:
+                        linters.add(linter)
+        return linters
 
-        print("=" * 80)
-        print("Running linter: {0}".format(linter))
-        sys.stdout.flush()
-        start = time.time()
-        output = ""
-        config = LINTERS.get(linter)
-        try:
-            if (install or autorun) and config.get("install"):
-                install_linter(config)
-            if config.get("run_per_file"):
-                output = run_per_file(config, ignore_paths, config_dir)
+
+    def all_filenames_in_dir(self, path=None, ignore_paths=None):
+        path = path or os.getcwd()
+        # http://stackoverflow.com/a/2186565
+        paths = set()
+        for root, dirnames, filenames in os.walk(path, topdown=True):
+            try:
+                for ignore in ignore_paths:
+                    dirnames.remove(ignore)
+            except ValueError:
+                pass
+            if self.should_ignore_path(root, ignore_paths):
+                continue
+
+            for filename in filenames:
+                full_path = os.path.join(root, filename)
+                if "text" in identify.tags_from_path(full_path):
+                    paths.add(full_path)
+        return paths
+
+
+    def should_autorun(self, config, filenames):
+        patterns = PATTERNS.get(config.get("language"))
+        if config.get("autorun"):
+            for pattern in patterns:
+                if fnmatch.filter(filenames, pattern):
+                    return True
+
+        return False
+
+    def dotfiles_exist(self, config, path=None):
+        path = path or os.getcwd()
+        return any(
+            dotfile.strip() in os.listdir(path) for dotfile in config.get("dotfiles")
+        )
+
+    async def install_linter(self, config):
+        install_cmds = config.get("install")
+        for install_cmd in install_cmds:
+            if install_cmd in self.previous_install_commands:
+                continue
+
+            self.previous_install_commands.append(install_cmd)
+            if not self.installed(config):
+                try:
+                    print("-" * 80)
+                    await self.run_command(install_cmd, log_all=True)
+                except OSError:
+                    print(
+                        "Install failed: {0}\n{1}".format(
+                            install_cmd, traceback.format_exc()
+                        )
+                    )
             else:
-                cmd = run_config(config, config_dir)
-                _, output = run_command(cmd)
-                output = output.strip()
-        except Exception:
-            print("Running {0} failed:".format(linter))
-            print(traceback.format_exc())
-            print("Failed {0} output: {1}".format(linter, output))
-        print(
-            "Installation and running of {0} took {1} seconds".format(
-                linter, int(time.time() - start)
-            )
-        )
-        sys.stdout.flush()
-        start = time.time()
-        try:
-            if output:
-                linter_messages = config.get("parser")().parse(output)
-                # prepend linter name to message content
-                linter_messages = {
-                    (msg[0], msg[1], "{0}: {1}".format(linter, msg[2]))
-                    for msg in linter_messages
-                    if not should_ignore_path(msg[0], ignore_paths)
-                }
+                return
+
+    async def install_trusted(self):
+        for install_cmd in TRUSTED_INSTALL:
+            try:
+                print("*" * 80)
+                await self.run_command(install_cmd, log_all=True)
+            except OSError:
                 print(
-                    "Found {0} messages from {1}".format(len(linter_messages), linter)
+                    "Install failed: {0}\n{1}".format(install_cmd, traceback.format_exc())
                 )
-                messages.add_messages(linter_messages)
-        except Exception:
-            print("Parsing {0} output failed:".format(linter))
-            print(traceback.format_exc())
-            print(output)
-        print(
-            "Parsing of {0} took {1} seconds".format(linter, int(time.time() - start))
-        )
-    return messages.get_messages()
+
+    async def installed(self, config):
+        try:
+            returncode, _ = await self.run_command(config.get("help"))
+            return returncode == 0
+
+        except (subprocess.CalledProcessError, OSError):
+            return False
+
+    def run_config(self, config, config_dir):
+        if self.dotfiles_exist(config) and config.get("run"):
+            return config.get("run")
+
+        if not (config_dir and self.dotfiles_exist(config, config_dir)):
+            config_dir = os.path.abspath(os.path.join(HERE, "config"))
+        return [
+            os.path.normpath(item.format(config_dir=config_dir))
+            if "..." not in item
+            else item.format(config_dir=config_dir)
+            for item in (config.get("rundefault") or config.get("run"))
+        ]
+
+    def lint(self,
+        install=False,
+        autorun=False,
+        ignore_paths=None,
+        config_dir=None,
+        enabled_linters=None,
+        disabled_linters=None,
+        trusted=False,
+    ):
+        return self.event_loop.run_until_complete(self.run_linters(
+            install, autorun, ignore_paths, config_dir, enabled_linters, disabled_linters, trusted))
+
+    async def run_linters(self,
+        install,
+        autorun,
+        ignore_paths,
+        config_dir,
+        enabled_linters,
+        disabled_linters,
+        trusted,
+    ):
+        messages = message.Messages()
+        self.cleanup()
+        await self.performance_hacks()
+        if trusted and (install or autorun):
+            self.install_trusted()
+        for linter in self.linters_to_run(
+            autorun, ignore_paths, enabled_linters, disabled_linters
+        ):
+            if system.should_stop():
+                return messages.get_messages()
+
+            print("=" * 80)
+            print("Running linter: {0}".format(linter))
+            sys.stdout.flush()
+            start = time.time()
+            output = ""
+            config = LINTERS.get(linter)
+            try:
+                if (install or autorun) and config.get("install"):
+                    self.install_linter(config)
+                if config.get("run_per_file"):
+                    output = await self.run_per_file(config, ignore_paths, config_dir)
+                else:
+                    cmd = self.run_config(config, config_dir)
+                    _, output = await self.run_command(cmd)
+                    output = output.strip()
+            except Exception:
+                print("Running {0} failed:".format(linter))
+                print(traceback.format_exc())
+                print("Failed {0} output: {1}".format(linter, output))
+            print(
+                "Installation and running of {0} took {1} seconds".format(
+                    linter, int(time.time() - start)
+                )
+            )
+            sys.stdout.flush()
+            start = time.time()
+            try:
+                if output:
+                    linter_messages = config.get("parser")().parse(output)
+                    # prepend linter name to message content
+                    linter_messages = {
+                        (msg[0], msg[1], "{0}: {1}".format(linter, msg[2]))
+                        for msg in linter_messages
+                        if not self.should_ignore_path(msg[0], ignore_paths)
+                    }
+                    print(
+                        "Found {0} messages from {1}".format(len(linter_messages), linter)
+                    )
+                    messages.add_messages(linter_messages)
+            except Exception:
+                print("Parsing {0} output failed:".format(linter))
+                print(traceback.format_exc())
+                print(output)
+            print(
+                "Parsing of {0} took {1} seconds".format(linter, int(time.time() - start))
+            )
+        return messages.get_messages()
